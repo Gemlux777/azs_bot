@@ -64,14 +64,17 @@ async def process_coords(message: Message, lat: float, lon: float, state: FSMCon
     stations = await find_fuel_stations(lat, lon, radius_km=5)
 
     if not stations:
-        await message.answer("Рядом не нашёл АЗС в OpenStreetMap. Попробуй другое место.")
+        await message.answer("Рядом не нашёл АЗС. Попробуй другое место или увеличим радиус позже.")
         return
 
     await state.update_data(stations=stations)
 
     lines = ["Нашёл АЗС:\n"]
     for i, s in enumerate(stations, 1):
-        lines.append(f"{i}. {s['name']} — {s['distance_km']} км")
+        line = f"{i}. {s['name']} — {s['distance_km']} км"
+        if s.get("address"):
+            line += f"\n   📍 {s['address']}"
+        lines.append(line)
 
     lines.append("\nВыбери АЗС, чтобы отметить наличие топлива:")
     await message.answer("\n".join(lines), reply_markup=stations_keyboard(stations))
@@ -105,10 +108,12 @@ async def pick_station(callback: CallbackQuery, state: FSMContext):
             InlineKeyboardButton(text="🔴 Нет", callback_data=f"report:{station_id}:empty"),
         ]
     ])
-    await callback.message.edit_text(
-        f"{station['name']} ({station['distance_km']} км)\n\nЧто сейчас с топливом?",
-        reply_markup=kb
-    )
+    text = f"{station['name']} ({station['distance_km']} км)"
+    if station.get("address"):
+        text += f"\n📍 {station['address']}"
+    text += "\n\nЧто сейчас с топливом?"
+
+    await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("report:"))
