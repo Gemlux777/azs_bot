@@ -1,33 +1,19 @@
-import aiohttp
-import math
-
-GIS_API_KEY = "4af31c9c-8314-48d1-b0f6-277847598479"
-GIS_URL = "https://catalog.api.2gis.com/3.0/markers"
-
-def haversine(lat1, lon1, lat2, lon2):
-    R = 6371  # km
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
-    return R * 2 * math.asin(math.sqrt(a))
-
 async def find_fuel_stations(lat, lon, radius_km=5):
-    # 2GIS ждёт "lon,lat", а не "lat,lon"
-    point = f"{lon},{lat}"
+    # 2GIS ждёт "lon,lat"
+    location = f"{lon},{lat}"
     params = {
         "q": "АЗС",
-        "type": "branch",
-        "point": point,
+        "location": location,
         "radius": int(radius_km * 1000),
-        "sort": "distance",
         "page_size": 10,
         "key": GIS_API_KEY,
     }
+    url = "https://catalog.api.2gis.com/3.0/items"
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(GIS_URL, params=params) as resp:
+        async with session.get(url, params=params) as resp:
             if resp.status != 200:
-                print(f"2GIS error: status={resp.status}, body={await resp.text()[:300]}")
+                print(f"2GIS HTTP error: status={resp.status}, body={await resp.text()[:300]}")
                 return []
             try:
                 data = await resp.json()
@@ -41,12 +27,16 @@ async def find_fuel_stations(lat, lon, radius_km=5):
 
     stations = []
     for item in data.get("result", {}).get("items", []):
-        geom = item.get("geometry", {})
-        centroid = geom.get("centroid") or geom.get("point")
-        if not centroid:
+        # У /3.0/items координаты в item.point
+        point = item.get("point") or item.get("geometry", {}).get("centroid")
+        if not point:
             continue
+        # point может быть {"lat":..., "lon":...} или строкой "lon lat"
+        if isinstance(point, dict):
+            s_lat, s_lon = point["lat"], point["lon"]
+        else:
+            s_lon, s_lat = map(float, point.split())
 
-        s_lon, s_lat = map(float, centroid.split())
         name = item.get("name", "АЗС без названия")
         address = item.get("address_name", "")
         dist = haversine(lat, lon, s_lat, s_lon)
