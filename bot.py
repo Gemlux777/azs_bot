@@ -1,167 +1,128 @@
-import asyncio
-import logging
-import os
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
+import aiohttp
+import math
 
-from database import init_db, save_station, save_report
-from osm import find_fuel_stations
+GIS_API_KEY = "4af31c9c-8314-48d1-b0f6-277847598479"
+GIS_URL = "https://catalog.api.2gis.com/3.0/items"
+FUEL_RUBRIC_ID = "18547"
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8950559517:AAE104K0EIfeyKE7NCofLrIWUivy76tU19s")
+GDEBENZ_URL = "https://gdebenz.ru/api/nearby"
 
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
 
-class Form(StatesGroup):
-    waiting_location = State()
-
-# Эмодзи для статусов, которые приходят из gdebenz (osm.py)
-STATUS_EMOJI = {
-    "yes": "⛽",
-    "queue": "🟡",
-    "low": "🟡",
-    "no": "🔴",
-    "unknown": "⚪",
-}
-
-# Расшифровка для кнопок отметки (ручной краудсорсинг)
-MANUAL_STATUS = {
-    "fuel": "⛽ Есть",
-    "low": "🟡 Мало",
-    "empty": "🔴 Нет",
-}
-
-@dp.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext):
-    await state.set_state(Form.waiting_location)
-    await message.answer(
-        "Привет! Я покажу АЗС рядом и статус топлива по данным gdebenz (народная карта).\n\n"
-        "Отправь геолокацию (📎 → Локация) или напиши город."
-    )
-
-@dp.message(F.location)
-async def handle_location(message: Message, state: FSMContext):
-    lat = message.location.latitude
-    lon = message.location.longitude
-    await process_coords(message, lat, lon, state)
-
-@dp.message(F.text & ~F.text.startswith("/"))
-async def handle_city(message: Message, state: FSMContext):
-    city = message.text.strip().lower()
-    cities = {
-        "москва": (55.7558, 37.6173),
-        "санкт-петербург": (59.9343, 30.3351),
-        "казань": (55.7963, 49.1088),
-        "екатеринбург": (56.8389, 60.6057),
-        "новосибирск": (55.0084, 82.9357),
-        "ростов-на-дону": (47.2357, 39.7015),
+async def get_gdebenz_stations(session, lat, lon, radius_km=10):
+    """Запрашивает станции с отметками из gdebenz."""
+    params = {
+        "lat": lat,
+        "lon": lon,
+        "radius_km": radius_km,
     }
-    if city in cities:
-        lat, lon = cities[city]
-        await process_coords(message, lat, lon, state)
-    else:
-        await message.answer(
-            "Пока знаю только: Москва, Санкт-Петербург, Казань, Екатеринбург, Новосибирск, Ростов-на-Дону.\n"
-            "Или отправь геолокацию (📎 → Локация)."
-        )
+    try:
+        async with session.get(GDEBENZ_URL, params=params) as resp:
+            if resp.status != 200:
+                print(f"gdebenz HTTP error: {resp.status}")
+                return []
+            try:
+                data = await resp.json()
+            except Exception as e:
+                print(f"gdebenz JSON error: {e}")
+                return []
+            return data.get("stations", [])
+    except Exception as e:
+        print(f"gdebenz request error: {e}")
+        return []
 
-async def process_coords(message: Message, lat: float, lon: float, state: FSMContext):
-    await message.answer("Ищу АЗС в радиусе 10 км и проверяю данные gdebenz...")
-    stations = await find_fuel_stations(lat, lon, radius_km=10)
+def match_gdebenz_status(station, gdebenz_list):
+    """Находит ближайшую отметку gdebenz для станции 2GIS."""
+    if not gdebenz_list:
+        return None
+    best = None
+    best_dist = float("inf")
+    for g in gdebenz_list:
+        g_lat, g_lon = g.get("lat"), g.get("lon")
+        if g_lat is None or g_lon is None:
+            continue
+        dist = haversine(station["lat"], station["lon"], g_lat, g_lon)
+        if dist < best_dist:
+            best_dist = dist
+            best = g
+    # Если ближайшая отметка дальше 300 м — это другая АЗС
+    if best and best_dist < 0.3:
+        return best
+    return None
 
-    if not stations:
-        await message.answer("Рядом не нашёл АЗС. Попробуй другое место.")
-        return
+async def find_fuel_stations(lat, lon, radius_km=10):
+    location = f"{lon},{lat}"
+    params = {
+        "rubric_id": FUEL_RUBRIC_ID,
+        "location": location,
+        "radius": int(radius_km * 1000),
+        "page_size": 20,
+        "sort": "distance",
+        "fields": "items.point,items.address,items.name",
+        "key": GIS_API_KEY,
+    }
 
-    await state.update_data(stations=stations)
+    async with aiohttp.ClientSession() as session:
+        # 1. Получаем список АЗС из 2GIS
+        async with session.get(GIS_URL, params=params) as resp:
+            if resp.status != 200:
+                print(f"2GIS HTTP error: status={resp.status}")
+                return []
+            try:
+                data = await resp.json()
+            except Exception as e:
+                print(f"2GIS JSON error: {e}")
+                return []
 
-    lines = ["Нашёл АЗС (радиус 10 км):\n"]
-    for i, s in enumerate(stations, 1):
-        # Берём статус из gdebenz (fuel_status), если нет — unknown
-        status = s.get("fuel_status", "unknown")
-        emoji = STATUS_EMOJI.get(status, "⚪")
-        
-        line = f"{emoji} {i}. {s['name']} — {s['distance_km']} км"
-        if s.get("address"):
-            line += f"\n   📍 {s['address']}"
-        lines.append(line)
+        if data.get("meta", {}).get("code") != 200:
+            print(f"2GIS meta error: {data.get('meta')}")
+            return []
 
-    lines.append("\n⚪ = нет данных, ⛽ = есть, 🟡 = мало/очередь, 🔴 = нет")
-    lines.append("Данные: gdebenz (народная карта, могут быть неточными)")
-    lines.append("\nНажми на АЗС, чтобы посмотреть детали или поставить свою отметку:")
-    await message.answer("\n".join(lines), reply_markup=stations_keyboard(stations))
+        items = data.get("result", {}).get("items", [])
+        if not items:
+            print("2GIS returned 0 items")
+            return []
 
-def stations_keyboard(stations):
-    buttons = []
-    for s in stations:
-        status = s.get("fuel_status", "unknown")
-        emoji = STATUS_EMOJI.get(status, "⚪")
-        buttons.append([InlineKeyboardButton(
-            text=f"{emoji} {s['name']} ({s['distance_km']} км)",
-            callback_data=f"pick:{s['osm_id']}"
-        )])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+        # 2. Получаем данные gdebenz
+        gdebenz_list = await get_gdebenz_stations(session, lat, lon, radius_km)
 
-@dp.callback_query(F.data.startswith("pick:"))
-async def pick_station(callback: CallbackQuery, state: FSMContext):
-    osm_id = callback.data.split(":", 1)[1]
-    data = await state.get_data()
-    stations = data.get("stations", [])
-    station = next((s for s in stations if s["osm_id"] == osm_id), None)
+    stations = []
+    for item in items:
+        point = item.get("point") or item.get("geometry", {}).get("centroid")
+        if not point:
+            continue
+        if isinstance(point, dict):
+            s_lat, s_lon = point["lat"], point["lon"]
+        else:
+            s_lon, s_lat = map(float, point.split())
 
-    if not station:
-        await callback.answer("АЗС не найдена, попробуй заново /start")
-        return
+        station = {
+            "osm_id": str(item.get("id")),
+            "name": item.get("name", "АЗС"),
+            "lat": s_lat,
+            "lon": s_lon,
+            "address": item.get("address_name", ""),
+            "distance_km": round(haversine(lat, lon, s_lat, s_lon), 1),
+            "fuel_status": "unknown",
+            "fuels_now": "",
+            "detail": "",
+            "confirmations": 0,
+        }
 
-    # Сохраняем станцию в БД (чтобы потом можно было ставить отметки)
-    station_id = await save_station(osm_id, station["name"], station["lat"], station["lon"])
+        # Сопоставляем с gdebenz
+        g = match_gdebenz_status(station, gdebenz_list)
+        if g:
+            station["fuel_status"] = g.get("status", "unknown")
+            station["fuels_now"] = g.get("fuels_now", "") or g.get("detail", "")
+            station["detail"] = g.get("detail", "")
+            station["confirmations"] = g.get("confirmations", 0)
 
-    # Показываем статус из gdebenz
-    status = station.get("fuel_status", "unknown")
-    emoji = STATUS_EMOJI.get(status, "⚪")
-    status_text = {
-        "yes": "⛽ Есть топливо",
-        "queue": "🟡 Очередь",
-        "low": "🟡 Мало топлива",
-        "no": "🔴 Нет топлива",
-        "unknown": "⚪ Нет данных от gdebenz",
-    }.get(status, "⚪ Нет данных")
+        stations.append(station)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="⛽ Есть", callback_data=f"report:{station_id}:fuel"),
-            InlineKeyboardButton(text="🟡 Мало", callback_data=f"report:{station_id}:low"),
-            InlineKeyboardButton(text="🔴 Нет", callback_data=f"report:{station_id}:empty"),
-        ]
-    ])
-    text = f"{station['name']} ({station['distance_km']} км)"
-    if station.get("address"):
-        text += f"\n📍 {station['address']}"
-    text += f"\n\nДанные gdebenz: {status_text}"
-    text += f"\n\nЕсли видишь другое — поставь свою отметку:"
-
-    await callback.message.edit_text(text, reply_markup=kb)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("report:"))
-async def report_status(callback: CallbackQuery):
-    _, station_id, status = callback.data.split(":")
-    await save_report(int(station_id), status, callback.from_user.id)
-
-    await callback.message.edit_text(
-        f"Спасибо! Твоя отметка сохранена: {MANUAL_STATUS.get(status, status)}\n\n"
-        f"Чтобы проверить другую АЗС — /start"
-    )
-    await callback.answer("Сохранено")
-
-async def main():
-    await init_db()
-    print("Бот запущен")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    stations.sort(key=lambda x: x["distance_km"])
+    return stations[:15]
