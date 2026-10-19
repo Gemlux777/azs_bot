@@ -10,7 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 from database import init_db, save_station, save_report
 from osm import find_fuel_stations
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8950559517:AAE104K0EIfeyKE7NCofLrIWUivy76tU19s")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_СВОЙ_ТОКЕН_СЮДА")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -19,17 +19,27 @@ dp = Dispatcher()
 class Form(StatesGroup):
     waiting_location = State()
 
+# Эмодзи для статусов, которые приходят из gdebenz (osm.py)
 STATUS_EMOJI = {
+    "yes": "⛽",
+    "queue": "🟡",
+    "low": "🟡",
+    "no": "🔴",
+    "unknown": "⚪",
+}
+
+# Расшифровка для кнопок отметки (ручной краудсорсинг)
+MANUAL_STATUS = {
     "fuel": "⛽ Есть",
     "low": "🟡 Мало",
-    "empty": "🔴 Нет"
+    "empty": "🔴 Нет",
 }
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.set_state(Form.waiting_location)
     await message.answer(
-        "Привет! Я покажу АЗС рядом и подскажу, где есть топливо.\n\n"
+        "Привет! Я покажу АЗС рядом и статус топлива по данным gdebenz (народная карта).\n\n"
         "Отправь геолокацию (📎 → Локация) или напиши город."
     )
 
@@ -60,30 +70,38 @@ async def handle_city(message: Message, state: FSMContext):
         )
 
 async def process_coords(message: Message, lat: float, lon: float, state: FSMContext):
-    await message.answer("Ищу АЗС в радиусе 5 км...")
-    stations = await find_fuel_stations(lat, lon, radius_km=5)
+    await message.answer("Ищу АЗС в радиусе 10 км и проверяю данные gdebenz...")
+    stations = await find_fuel_stations(lat, lon, radius_km=10)
 
     if not stations:
-        await message.answer("Рядом не нашёл АЗС. Попробуй другое место или увеличим радиус позже.")
+        await message.answer("Рядом не нашёл АЗС. Попробуй другое место.")
         return
 
     await state.update_data(stations=stations)
 
-    lines = ["Нашёл АЗС:\n"]
+    lines = ["Нашёл АЗС (радиус 10 км):\n"]
     for i, s in enumerate(stations, 1):
-        line = f"{i}. {s['name']} — {s['distance_km']} км"
+        # Берём статус из gdebenz (fuel_status), если нет — unknown
+        status = s.get("fuel_status", "unknown")
+        emoji = STATUS_EMOJI.get(status, "⚪")
+        
+        line = f"{emoji} {i}. {s['name']} — {s['distance_km']} км"
         if s.get("address"):
             line += f"\n   📍 {s['address']}"
         lines.append(line)
 
-    lines.append("\nВыбери АЗС, чтобы отметить наличие топлива:")
+    lines.append("\n⚪ = нет данных, ⛽ = есть, 🟡 = мало/очередь, 🔴 = нет")
+    lines.append("Данные: gdebenz (народная карта, могут быть неточными)")
+    lines.append("\nНажми на АЗС, чтобы посмотреть детали или поставить свою отметку:")
     await message.answer("\n".join(lines), reply_markup=stations_keyboard(stations))
 
 def stations_keyboard(stations):
     buttons = []
     for s in stations:
+        status = s.get("fuel_status", "unknown")
+        emoji = STATUS_EMOJI.get(status, "⚪")
         buttons.append([InlineKeyboardButton(
-            text=f"{s['name']} ({s['distance_km']} км)",
+            text=f"{emoji} {s['name']} ({s['distance_km']} км)",
             callback_data=f"pick:{s['osm_id']}"
         )])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -99,7 +117,19 @@ async def pick_station(callback: CallbackQuery, state: FSMContext):
         await callback.answer("АЗС не найдена, попробуй заново /start")
         return
 
+    # Сохраняем станцию в БД (чтобы потом можно было ставить отметки)
     station_id = await save_station(osm_id, station["name"], station["lat"], station["lon"])
+
+    # Показываем статус из gdebenz
+    status = station.get("fuel_status", "unknown")
+    emoji = STATUS_EMOJI.get(status, "⚪")
+    status_text = {
+        "yes": "⛽ Есть топливо",
+        "queue": "🟡 Очередь",
+        "low": "🟡 Мало топлива",
+        "no": "🔴 Нет топлива",
+        "unknown": "⚪ Нет данных от gdebenz",
+    }.get(status, "⚪ Нет данных")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -111,7 +141,8 @@ async def pick_station(callback: CallbackQuery, state: FSMContext):
     text = f"{station['name']} ({station['distance_km']} км)"
     if station.get("address"):
         text += f"\n📍 {station['address']}"
-    text += "\n\nЧто сейчас с топливом?"
+    text += f"\n\nДанные gdebenz: {status_text}"
+    text += f"\n\nЕсли видишь другое — поставь свою отметку:"
 
     await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
@@ -120,8 +151,9 @@ async def pick_station(callback: CallbackQuery, state: FSMContext):
 async def report_status(callback: CallbackQuery):
     _, station_id, status = callback.data.split(":")
     await save_report(int(station_id), status, callback.from_user.id)
+
     await callback.message.edit_text(
-        f"Спасибо! Отметил: {STATUS_EMOJI.get(status, status)}\n\n"
+        f"Спасибо! Твоя отметка сохранена: {MANUAL_STATUS.get(status, status)}\n\n"
         f"Чтобы проверить другую АЗС — /start"
     )
     await callback.answer("Сохранено")
