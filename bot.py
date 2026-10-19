@@ -10,7 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 from database import init_db, save_station, save_report
 from osm import find_fuel_stations
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_СВОЙ_ТОКЕН_СЮДА")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8950559517:AAE104K0EIfeyKE7NCofLrIWUivy76tU19s")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
