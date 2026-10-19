@@ -84,7 +84,7 @@ async def _find_fuel_stations_internal(lat, lon, radius_km):
         "rubric_id": FUEL_RUBRIC_ID,
         "location": location,
         "radius": int(radius_km * 1000),
-        "page_size": 20,
+        "page_size": 10,
         "sort": "distance",
         "fields": "items.point,items.address,items.name",
         "key": GIS_API_KEY,
