@@ -15,33 +15,32 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * math.asin(math.sqrt(a))
 
 
-async def get_gdebenz_stations(session, lat, lon, radius_km=10):
-    """Запрашивает отметки из gdebenz. Никогда не бросает исключение."""
-    params = {"lat": lat, "lon": lon, "radius_km": radius_km}
+async def _fetch_gdebenz(session, lat, lon, radius_km):
+    """Безопасный запрос к gdebenz. Никогда не бросает исключение."""
     try:
+        params = {"lat": lat, "lon": lon, "radius_km": radius_km}
         async with session.get(GDEBENZ_URL, params=params) as resp:
             if resp.status != 200:
-                print(f"gdebenz HTTP error: {resp.status}")
+                print(f"gdebenz HTTP {resp.status}")
                 return []
             try:
-                data = await resp.json(content_type=None)
+                # Убрали content_type=None, используем стандартный вызов
+                data = await resp.json()
             except Exception as e:
-                print(f"gdebenz JSON error: {e}")
+                print(f"gdebenz JSON parse error: {e}")
                 return []
-            stations = data.get("stations", [])
-            print(f"gdebenz: got {len(stations)} stations")
-            return stations
+            return data.get("stations", [])
     except Exception as e:
-        print(f"gdebenz request error: {e}")
+        print(f"gdebenz network error: {e}")
         return []
 
 
-def match_gdebenz(station, gdebenz_list):
-    """Находит ближайшую отметку gdebenz в радиусе 300 м."""
-    if not gdebenz_list:
+def _find_match(station, g_list):
+    """Ищет ближайшую отметку gdebenz в радиусе 300 м."""
+    if not g_list:
         return None
     best, best_dist = None, float("inf")
-    for g in gdebenz_list:
+    for g in g_list:
         try:
             g_lat = float(g.get("lat"))
             g_lon = float(g.get("lon"))
@@ -50,21 +49,20 @@ def match_gdebenz(station, gdebenz_list):
         dist = haversine(station["lat"], station["lon"], g_lat, g_lon)
         if dist < best_dist:
             best_dist, best = dist, g
-    if best and best_dist < 0.3:
-        return best
-    return None
+    return best if best_dist < 0.3 else None
 
 
 async def find_fuel_stations(lat, lon, radius_km=10):
-    """Главная функция. Никогда не бросает исключение — при любой ошибке вернёт []."""
+    """Главная функция. Всегда возвращает список, никогда не падает."""
     try:
-        return await _find_fuel_stations(lat, lon, radius_km)
+        return await _find_fuel_stations_internal(lat, lon, radius_km)
     except Exception as e:
-        print(f"find_fuel_stations fatal error: {e}")
+        print(f"FATAL find_fuel_stations: {e}")
         return []
 
 
-async def _find_fuel_stations(lat, lon, radius_km):
+async def _find_fuel_stations_internal(lat, lon, radius_km):
+    # 1. 2GIS
     location = f"{lon},{lat}"
     params = {
         "rubric_id": FUEL_RUBRIC_ID,
@@ -77,13 +75,12 @@ async def _find_fuel_stations(lat, lon, radius_km):
     }
 
     async with aiohttp.ClientSession() as session:
-        # 1. 2GIS — список АЗС
         try:
             async with session.get(GIS_URL, params=params) as resp:
                 if resp.status != 200:
-                    print(f"2GIS HTTP error: {resp.status}")
+                    print(f"2GIS HTTP {resp.status}")
                     return []
-                data = await resp.json(content_type=None)
+                data = await resp.json()
         except Exception as e:
             print(f"2GIS request error: {e}")
             return []
@@ -93,13 +90,14 @@ async def _find_fuel_stations(lat, lon, radius_km):
             return []
 
         items = data.get("result", {}).get("items", [])
-        print(f"2GIS: got {len(items)} items")
+        print(f"2GIS: {len(items)} items")
         if not items:
             return []
 
-        # 2. gdebenz — отметки о топливе
-        gdebenz_list = await get_gdebenz_stations(session, lat, lon, radius_km)
+        # 2. gdebenz
+        g_list = await _fetch_gdebenz(session, lat, lon, radius_km)
 
+    # 3. Сборка результата
     stations = []
     for item in items:
         try:
@@ -115,7 +113,7 @@ async def _find_fuel_stations(lat, lon, radius_km):
             print(f"parse point error: {e}")
             continue
 
-        station = {
+        st = {
             "osm_id": str(item.get("id", "")),
             "name": item.get("name", "АЗС"),
             "lat": s_lat,
@@ -128,17 +126,17 @@ async def _find_fuel_stations(lat, lon, radius_km):
             "confirmations": 0,
         }
 
-        g = match_gdebenz(station, gdebenz_list)
-        if g:
-            station["fuel_status"] = g.get("status", "unknown") or "unknown"
-            station["fuels_now"] = g.get("fuels_now", "") or ""
-            station["detail"] = g.get("detail", "") or ""
+        match = _find_match(st, g_list)
+        if match:
+            st["fuel_status"] = match.get("status", "unknown") or "unknown"
+            st["fuels_now"] = match.get("fuels_now", "") or ""
+            st["detail"] = match.get("detail", "") or ""
             try:
-                station["confirmations"] = int(g.get("confirmations", 0) or 0)
+                st["confirmations"] = int(match.get("confirmations", 0) or 0)
             except (TypeError, ValueError):
-                station["confirmations"] = 0
+                st["confirmations"] = 0
 
-        stations.append(station)
+        stations.append(st)
 
     stations.sort(key=lambda x: x["distance_km"])
     return stations[:15]
